@@ -3,33 +3,10 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 
-VT_URL = "https://www.nerunner.com/states/vermont/"
-NH_URL = "https://www.nerunner.com/states/new-hampshire/"
+CAL_URL = "https://www.nerunner.com/race-calendar/"
 
-# Accept both 3-letter and full month names (because the site text can vary)
-MONTHS = [
-    ("may", ["may"]),
-    ("jun", ["jun", "june"]),
-    ("jul", ["jul", "july"]),
-    ("aug", ["aug", "august"]),
-    ("sep", ["sep", "sept", "september"]),
-    ("oct", ["oct", "october"]),
-]
-MONTH_WORDS = {w for _, words in MONTHS for w in words}
-
-DATE_PATTERNS = [
-    # "03 may" or "3 may"
-    re.compile(r"^\s*(\d{1,2})\s+(may|jun|jul|aug|sep|oct)\b", re.IGNORECASE),
-    # "may 03" or "may 3"
-    re.compile(r"^\s*(may|june|july|august|sept|september|oct|october)\s+(\d{1,2})\b", re.IGNORECASE),
-]
-
-def normalize_month(token: str) -> str:
-    t = token.lower()
-    for short, words in MONTHS:
-        if t in words or t == short:
-            return short
-    return t[:3]
+ALLOWED_MONTHS = ["may", "jun", "jul", "aug", "sep", "oct"]
+ALLOWED_STATES = {"vermont": "Vermont", "new hampshire": "New Hampshire"}
 
 @st.cache_data(ttl=3600)
 def fetch_lines(url: str):
@@ -41,113 +18,117 @@ def fetch_lines(url: str):
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n") if ln.strip()]
     return lines
 
-def find_nearest_date(lines, idx):
-    # Walk up a bit to find a nearby date line
-    for j in range(max(0, idx - 30), idx)[::-1]:
-        ln = lines[j]
-        for pat in DATE_PATTERNS:
-            m = pat.match(ln)
-            if m:
-                # pattern 1: day, mon   pattern 2: mon, day
-                if pat is DATE_PATTERNS[0]:
-                    day = m.group(1)
-                    mon = normalize_month(m.group(2))
-                else:
-                    mon = normalize_month(m.group(1))
-                    day = m.group(2)
-                return mon.upper(), str(day).zfill(2)
-    return None, None
-
-def month_in_window(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(rf"\b{re.escape(w)}\b", t) for w in MONTH_WORDS)
-
-def extract_race_name(lines, idx):
+def parse_calendar(lines):
     """
-    Heuristic: race name is often near the distance line.
-    We'll look a few lines above for something "title-like".
+    Looks for event lines that contain:
+      - a date like "03 may"
+      - "Race Distance:" and includes "10K"
+      - "State:" includes Vermont and/or New Hampshire
     """
-    for j in range(max(0, idx - 6), idx)[::-1]:
-        ln = lines[j]
-        # Skip obvious labels
-        if "race distance" in ln.lower() or "race type" in ln.lower() or "race director" in ln.lower():
+    events = []
+    date_re = re.compile(r"^(\d{1,2})\s+(%s)\b" % "|".join(ALLOWED_MONTHS), re.IGNORECASE)
+
+    for ln in lines:
+        m = date_re.match(ln)
+        if not m:
             continue
-        # Prefer lines that look like a title (not too long)
-        if 4 <= len(ln) <= 120:
-            return ln
-    return lines[idx]
 
-def build_rows(state_name: str, url: str):
-    lines = fetch_lines(url)
+        day = m.group(1).zfill(2)
+        mon = m.group(2).lower()
 
-    rows = []
+        if "Race Distance:" not in ln or "State:" not in ln:
+            continue
+        if "10K" not in ln.upper():
+            continue
 
-    for i, ln in enumerate(lines):
-        low = ln.lower()
+        # Extract state(s)
+        st_match = re.search(r"State:\s*([^ ](?:.*))$", ln)
+        # More robust: stop at end, but if other labels exist after State it can get messy.
+        # We'll just capture after "State:" and then split by spaces/commas heuristically.
+        state_blob = ln.split("State:", 1)[1].strip()
+        # often "Vermont" or "Maine,New Hampshire" etc.
+        state_candidates = [s.strip() for s in re.split(r"[,\|/]", state_blob) if s.strip()]
 
-        # Primary signal: distance label + 10K
-        if "race distance" in low and "10k" in low:
-            mon, day = find_nearest_date(lines, i)
-            # If we couldn't find a date nearby, keep it but mark unknown
-            date_str = f"{mon} {day}" if mon and day else "DATE ?"
+        matched_states = []
+        for s in state_candidates:
+            key = s.lower()
+            if key in ALLOWED_STATES:
+                matched_states.append(ALLOWED_STATES[key])
 
-            # Month filter: use date if found; otherwise allow if any month word appears nearby
-            if mon:
-                if mon.lower() not in {"MAY","JUN","JUL","AUG","SEP","OCT"}:
-                    continue
+        if not matched_states:
+            # Sometimes blob includes extra words; try substring match
+            blob_l = state_blob.lower()
+            if "vermont" in blob_l:
+                matched_states.append("Vermont")
+            if "new hampshire" in blob_l:
+                matched_states.append("New Hampshire")
+
+        if not matched_states:
+            continue
+
+        # Extract distance list
+        dist_blob = ln.split("Race Distance:", 1)[1]
+        dist_blob = dist_blob.split("State:", 1)[0].strip()
+        distances = [d.strip() for d in dist_blob.split(",") if d.strip()]
+
+        # Ensure it's truly a 10K option (not just “10K/5K” text weirdness)
+        if not any(d.upper() == "10K" for d in distances) and "10K" not in dist_blob.upper():
+            continue
+
+        # Try to pull a nicer race name: between first time and next time (common on this site)
+        time_matches = list(re.finditer(r"(\d{1,2}:\d{2}\s*(?:am|pm))", ln, re.IGNORECASE))
+        race_name = ln
+        start_time = ""
+        if time_matches:
+            start_time = time_matches[0].group(1).lower()
+            if len(time_matches) >= 2:
+                race_name = ln[time_matches[0].end():time_matches[1].start()].strip(" -–—")
             else:
-                # fallback month filter by nearby context
-                context = " ".join(lines[max(0, i-20): i+1]).lower()
-                if not month_in_window(context):
-                    continue
+                # up to Race Director if present
+                after = ln[time_matches[0].end():]
+                race_name = re.split(r"\s+Race Director:\s+", after, maxsplit=1)[0].strip(" -–—")
 
-            name = extract_race_name(lines, i)
-
-            rows.append({
-                "Date": date_str,
-                "State": state_name,
-                "Race": name,
-                "Distance line": ln,
+        for st_name in matched_states:
+            events.append({
+                "Date": f"{mon.upper()} {day}" + (f" • {start_time}" if start_time else ""),
+                "State": st_name,
+                "Race": race_name,
+                "Distances": ", ".join(distances) if distances else "10K",
+                "Source line": ln,
             })
 
-    # De-duplicate (sometimes the distance line appears twice)
+    # De-dupe
     seen = set()
-    deduped = []
-    for r in rows:
-        key = (r["Date"], r["State"], r["Race"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+    out = []
+    for e in events:
+        k = (e["Date"], e["State"], e["Race"])
+        if k not in seen:
+            seen.add(k)
+            out.append(e)
 
-    return deduped, lines
+    return out
 
 st.set_page_config(page_title="VT + NH 10K Races (May–Oct)", layout="wide")
 st.title("VT + NH 10K Races (May–Oct)")
 
 choice = st.selectbox("State", ["Both", "Vermont", "New Hampshire"])
-debug = st.checkbox("Debug (show sample matches)", value=False)
+debug = st.checkbox("Debug", value=False)
 
 if st.button("Force refresh (re-scrape)"):
     st.cache_data.clear()
 
-rows = []
-debug_info = {}
+with st.spinner("Scraping NERunner race calendar…"):
+    lines = fetch_lines(CAL_URL)
+    events = parse_calendar(lines)
 
-with st.spinner("Scraping NERunner…"):
-    if choice in ("Both", "Vermont"):
-        vt_rows, vt_lines = build_rows("Vermont", VT_URL)
-        rows += vt_rows
-        debug_info["VT_total_lines"] = len(vt_lines)
-        debug_info["VT_rows"] = len(vt_rows)
-    if choice in ("Both", "New Hampshire"):
-        nh_rows, nh_lines = build_rows("New Hampshire", NH_URL)
-        rows += nh_rows
-        debug_info["NH_total_lines"] = len(nh_lines)
-        debug_info["NH_rows"] = len(nh_rows)
+if choice != "Both":
+    events = [e for e in events if e["State"] == choice]
 
-st.caption(f"{len(rows)} races found (cached for 1 hour).")
-st.dataframe(rows, use_container_width=True, hide_index=True)
+st.caption(f"{len(events)} races found (cached for 1 hour).")
+st.dataframe(events, use_container_width=True, hide_index=True)
 
 if debug:
-    st.subheader("Debug")
-    st.write(debug_info)
+    st.write({
+        "calendar_lines": len(lines),
+        "sample_lines_with_10k": [ln for ln in lines if "10K" in ln.upper()][:20],
+    })
